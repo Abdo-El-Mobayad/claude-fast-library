@@ -4,7 +4,7 @@ If you use Claude Code across multiple projects, you're probably copying the sam
 
 This library solves that. One repo holds everything. Each project picks what it needs. Changes flow both ways. The entire system is controlled through natural language via the `/library` command.
 
-<p align="center"><a href="diagrams/hero-architecture.png"><img src="diagrams/hero-architecture.png" width="85%" alt="Library syncing to multiple projects" /></a></p>
+<p align="center"><a href="diagrams/variants.png"><img src="diagrams/variants.png" width="85%" alt="Library syncing to multiple projects" /></a></p>
 
 ## Getting Started
 
@@ -99,7 +99,7 @@ node sync.mjs --seed --name "CLAUDE--app"  # import existing project
 
 The same skill can have different versions for different projects. Variants use a `name--suffix` convention in the library but deploy under the base name.
 
-<p align="center"><a href="diagrams/variants.png"><img src="diagrams/variants.png" width="85%" alt="Variant resolution" /></a></p>
+<p align="center"><a href="diagrams/hero-architecture.png"><img src="diagrams/hero-architecture.png" width="85%" alt="Variant resolution" /></a></p>
 
 | In the library          | Deployed as             | Who gets it                        |
 | ----------------------- | ----------------------- | ---------------------------------- |
