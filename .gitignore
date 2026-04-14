@@ -1,0 +1,7 @@
+node_modules/
+*.log
+logs/
+.DS_Store
+Thumbs.db
+hooks/LibraryHook/pending-sync.json
+hooks/LibraryHook/logs/
