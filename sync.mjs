@@ -138,8 +138,23 @@ function projItemPath(projectRoot, category, deployName) {
   return join(projectRoot, '.claude', category, deployName + '.md');
 }
 
+const MANIFEST_FILENAME = 'library.json';
+const LEGACY_MANIFEST_FILENAME = '.library-manifest.json';
+
 function manifestPath(projectRoot) {
-  return join(projectRoot, '.claude', '.library-manifest.json');
+  return join(projectRoot, '.claude', MANIFEST_FILENAME);
+}
+
+function legacyManifestPath(projectRoot) {
+  return join(projectRoot, '.claude', LEGACY_MANIFEST_FILENAME);
+}
+
+function resolveManifestPath(projectRoot) {
+  const current = manifestPath(projectRoot);
+  if (existsSync(current)) return current;
+  const legacy = legacyManifestPath(projectRoot);
+  if (existsSync(legacy)) return legacy;
+  return current;
 }
 
 // ── Git Operations ───────────────────────────────────────────────────────────
@@ -205,11 +220,13 @@ function syncProject(projectRoot, map) {
   const claudeDir = join(projectRoot, '.claude');
   ensureDir(claudeDir);
 
-  // Read old manifest for cleanup
+  // Read old manifest for cleanup (handle legacy filename too)
   let oldManifest = null;
   const mPath = manifestPath(projectRoot);
-  if (existsSync(mPath)) {
-    try { oldManifest = readJSON(mPath); } catch {}
+  const legacyPath = legacyManifestPath(projectRoot);
+  const readPath = existsSync(mPath) ? mPath : (existsSync(legacyPath) ? legacyPath : null);
+  if (readPath) {
+    try { oldManifest = readJSON(readPath); } catch {}
   }
 
   const managed = {};
@@ -342,6 +359,11 @@ function syncProject(projectRoot, map) {
     managed
   };
   writeJSON(mPath, manifest);
+
+  // Remove legacy manifest if it still exists (one-time migration)
+  if (existsSync(legacyPath)) {
+    try { unlinkSync(legacyPath); console.log(`  Removed legacy ${LEGACY_MANIFEST_FILENAME}`); } catch {}
+  }
 
   console.log(`  Synced ${synced} items -> ${norm(projectRoot)}`);
   return manifest;
@@ -531,7 +553,7 @@ function pushDirSyncIgnoreAware(src, dest, patterns = []) {
 // ── Change Detection ────────────────────────────────────────────────────────
 
 function getChangedItems(projectRoot) {
-  const mPath = manifestPath(projectRoot);
+  const mPath = resolveManifestPath(projectRoot);
   if (!existsSync(mPath)) return [];
 
   const manifest = readJSON(mPath);
@@ -589,7 +611,7 @@ function confirm(message) {
 // ── PUSH (project -> library) ────────────────────────────────────────────────
 
 async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm) {
-  const mPath = manifestPath(projectRoot);
+  const mPath = resolveManifestPath(projectRoot);
   if (!existsSync(mPath)) { console.error('  No manifest. Run sync first.'); process.exit(1); }
   const manifest = readJSON(mPath);
   const ignoreMap = manifest.managed.ignore || {};
@@ -678,7 +700,7 @@ async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm)
 // ── DIFF ─────────────────────────────────────────────────────────────────────
 
 function diffProject(projectRoot) {
-  const mPath = manifestPath(projectRoot);
+  const mPath = resolveManifestPath(projectRoot);
   if (!existsSync(mPath)) { console.error('  No manifest. Run sync first.'); process.exit(1); }
 
   const manifest = readJSON(mPath);

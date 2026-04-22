@@ -50,7 +50,7 @@ Additionally, `master-skill-rules.json` and `master-agent-rules.json` are filter
 
 Before executing any operation:
 
-1. Read `.claude/.library-manifest.json` for: library path, managed items, last sync time, library commit
+1. Read `.claude/library.json` for: library path, managed items, last sync time, library commit (legacy projects may still have `.library-manifest.json` — both are auto-migrated on next sync)
 2. The manifest's `library_path` field tells you where the library repo lives
 3. If the manifest is missing AND no library repo exists locally, the user may need initial setup. Check for the "First-Time Setup" triggers below.
 4. If the manifest is missing but a library repo exists, suggest `/library seed` or `/library set me up`
@@ -88,7 +88,6 @@ This gives them their own private copy with sync.mjs, empty category directories
 3. **Note the local clone path.** The repo is cloned to `./{name}` in the current directory. Store this as `{library_path}` for the remaining steps.
 
 4. **Install the LibraryHook into the current project:**
-
    - Create `.claude/hooks/LibraryHook/` directory
    - Copy the 3 hook files from `{library_path}/hooks/LibraryHook/`:
      - `library-sync.mjs` (PostToolUse detector)
@@ -100,7 +99,6 @@ This gives them their own private copy with sync.mjs, empty category directories
    - Add to `.claude/.gitignore` (create if needed): `hooks/LibraryHook/pending-sync.json`
 
 5. **Copy the /library command into the current project:**
-
    - Copy `{library_path}/commands/library.md` to `.claude/commands/library.md`
 
 6. **Seed the current project into the library:**
@@ -495,7 +493,7 @@ Edit `.claude/settings.json`:
 
 **Diagnostic steps:**
 
-1. Check manifest exists: `.claude/.library-manifest.json`
+1. Check manifest exists: `.claude/library.json` (or legacy `.claude/.library-manifest.json`)
 2. Verify library path is accessible: check `library_path` in manifest
 3. Check library repo status: `cd {library_path} && git status`
 4. Check for lock files or pending operations

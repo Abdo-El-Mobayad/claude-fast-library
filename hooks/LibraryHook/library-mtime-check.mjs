@@ -78,8 +78,11 @@ function main() {
     const data = JSON.parse(input);
     if (!data.session_id) process.exit(0);
 
-    // Read manifest
-    const manifestPath = join(projectDir, ".claude", ".library-manifest.json");
+    // Read manifest (prefer new name, fall back to legacy)
+    let manifestPath = join(projectDir, ".claude", "library.json");
+    if (!existsSync(manifestPath)) {
+      manifestPath = join(projectDir, ".claude", ".library-manifest.json");
+    }
     if (!existsSync(manifestPath)) process.exit(0);
 
     const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));

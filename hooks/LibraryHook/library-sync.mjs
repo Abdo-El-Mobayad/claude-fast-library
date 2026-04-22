@@ -3,7 +3,7 @@
  * LibraryHook - Auto-sync library-managed files on edit (PostToolUse)
  *
  * Fires on Write/Edit. Checks if the edited file is library-managed
- * by reading .library-manifest.json. If managed, writes a timestamp
+ * by reading library.json. If managed, writes a timestamp
  * to pending-sync.json and spawns a detached worker that waits 180s
  * (debounce). If no further managed edits occur in that window, the
  * worker runs `sync.mjs --push --yes` to push changes to the library.
@@ -52,8 +52,11 @@ function main() {
         if (normalizedFile.endsWith('.log')) process.exit(0);
         if (normalizedFile.includes('/logs/')) process.exit(0);
 
-        // Read manifest
-        const manifestPath = join(projectDir, '.claude', '.library-manifest.json');
+        // Read manifest (prefer new name, fall back to legacy)
+        let manifestPath = join(projectDir, '.claude', 'library.json');
+        if (!existsSync(manifestPath)) {
+            manifestPath = join(projectDir, '.claude', '.library-manifest.json');
+        }
         if (!existsSync(manifestPath)) process.exit(0);
 
         const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
