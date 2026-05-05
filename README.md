@@ -36,6 +36,9 @@ gh repo create my-library --template Abdo-El-Mobayad/claude-fast-library --priva
 # In your project, init and sync
 cd my-project
 node ../my-library/sync.mjs --seed --name "CLAUDE--my-project"
+
+# Register the library path on this device (one-time per machine)
+node ../my-library/sync.mjs --link
 ```
 
 After either option, everything is `/library` from here on.
@@ -178,6 +181,7 @@ your-library/
 - **Git integration.** Sync pulls before operating. Push commits and pushes automatically
 - **Hash-based diff.** MD5 comparison for files and directories
 - **Ignore patterns.** Configure in `map.json` to exclude runtime artifacts from sync
+- **Per-device library path** stored in `~/.claude/library-paths.json` (gitignored, never shipped). Run `node sync.mjs --link` once per machine to register.
 
 ## Credits
 

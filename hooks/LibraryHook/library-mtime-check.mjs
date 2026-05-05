@@ -200,13 +200,15 @@ function main() {
     if (!changedFile) process.exit(0);
 
     // Found a changed file -- trigger debounced push
+    // Persist `libraryRemote` (not the resolved local path) so the worker
+    // re-resolves at run time. See library-sync.mjs for the full rationale.
     const timestamp = Date.now();
     writeFileSync(
       stateFile,
       JSON.stringify({
         timestamp,
         file: changedFile,
-        libraryPath: manifest.library_path,
+        libraryRemote: manifest.library_remote,
         projectDir,
       }),
       "utf-8",

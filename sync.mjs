@@ -15,6 +15,7 @@ import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
+import { writePathRegistry, removePathRegistryEntry, readPathRegistry } from './lib/library-path-resolver.mjs';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -229,6 +230,15 @@ function syncProject(projectRoot, map) {
     try { oldManifest = readJSON(readPath); } catch {}
   }
 
+  // Graceful migration: legacy manifests carry a per-machine `library_path`
+  // field. If it points to a valid directory on this device, register it
+  // into the per-device registry before we drop the field on the next write.
+  if (oldManifest?.library_path && existsSync(oldManifest.library_path)) {
+    try {
+      writePathRegistry(oldManifest.library_remote || getLibRemote(), norm(oldManifest.library_path));
+    } catch {}
+  }
+
   const managed = {};
   let synced = 0;
 
@@ -351,8 +361,10 @@ function syncProject(projectRoot, map) {
   if (ruleCount) console.log(`  Generated ${ruleCount} rule file(s)`);
 
   // Write manifest
+  // Note: `library_path` is intentionally OMITTED. The per-device path is
+  // resolved at runtime via `~/.claude/library-paths.json` (keyed by
+  // `library_remote`) so the manifest stays portable across machines.
   const manifest = {
-    library_path: norm(LIB),
     library_remote: getLibRemote(),
     synced_at: new Date().toISOString(),
     library_commit: getLibCommit(),
@@ -1117,7 +1129,6 @@ function seedProject(projectRoot, name, map) {
   }
 
   writeJSON(manifestPath(projectRoot), {
-    library_path: norm(LIB),
     library_remote: getLibRemote(),
     synced_at: new Date().toISOString(),
     library_commit: getLibCommit(),
@@ -1150,6 +1161,8 @@ function parseArgs() {
       case '--seed': parsed.command = 'seed'; break;
       case '--all': parsed.all = true; break;
       case '--init': parsed.command = 'init'; break;
+      case '--link': parsed.command = 'link'; break;
+      case '--unlink': parsed.command = 'unlink'; break;
       case '--project': parsed.project = args[++i]; break;
       case '--from': parsed.from = args[++i]; break;
       case '--name': parsed.name = args[++i]; break;
@@ -1202,6 +1215,8 @@ function printUsage() {
     --init [--profile <name>]         Add project using a profile
     --init [--from <path>]            Add project copying another's config
     --seed [--name <slug>]            Import project into library (initial setup)
+    --link                            Register this library's local path on this device (~/.claude/library-paths.json)
+    --unlink                          Remove this library's path entry from this device
 
   Options:
     --project <path>    Target specific project (default: cwd)
@@ -1245,6 +1260,17 @@ async function main() {
 
   const map = readMap();
 
+  // Self-populate the per-device registry on every invocation. sync.mjs
+  // knows its own __dirname, so any user who runs this script gets
+  // auto-registered without thinking about it. Idempotent — writePathRegistry
+  // is a no-op if the value is unchanged.
+  {
+    const remote = getLibRemote();
+    if (remote) {
+      try { writePathRegistry(remote, norm(LIB)); } catch {}
+    }
+  }
+
   switch (args.command) {
     case 'sync':
       if (args.all) {
@@ -1277,6 +1303,20 @@ async function main() {
     case 'seed':
       seedProject(projectRoot, args.name, map);
       break;
+    case 'link': {
+      const remote = getLibRemote();
+      if (!remote) { console.error('  No git remote in library directory.'); process.exit(1); }
+      const wrote = writePathRegistry(remote, norm(LIB));
+      console.log(wrote ? `  Linked ${remote} -> ${norm(LIB)} for this device` : `  Already linked: ${remote} -> ${norm(LIB)}`);
+      break;
+    }
+    case 'unlink': {
+      const remote = getLibRemote();
+      if (!remote) { console.error('  No git remote in library directory.'); process.exit(1); }
+      const removed = removePathRegistryEntry(remote);
+      console.log(removed ? `  Unlinked ${remote} from this device` : `  No registry entry for ${remote}`);
+      break;
+    }
     default:
       printUsage();
   }

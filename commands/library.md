@@ -88,6 +88,7 @@ This gives them their own private copy with sync.mjs, empty category directories
 3. **Note the local clone path.** The repo is cloned to `./{name}` in the current directory. Store this as `{library_path}` for the remaining steps.
 
 4. **Install the LibraryHook into the current project:**
+
    - Create `.claude/hooks/LibraryHook/` directory
    - Copy the 3 hook files from `{library_path}/hooks/LibraryHook/`:
      - `library-sync.mjs` (PostToolUse detector)
@@ -99,6 +100,7 @@ This gives them their own private copy with sync.mjs, empty category directories
    - Add to `.claude/.gitignore` (create if needed): `hooks/LibraryHook/pending-sync.json`
 
 5. **Copy the /library command into the current project:**
+
    - Copy `{library_path}/commands/library.md` to `.claude/commands/library.md`
 
 6. **Seed the current project into the library:**
@@ -509,7 +511,7 @@ If manifest is missing entirely, suggest: `/library seed` (to import existing pr
 1. **Confirm before destructive operations**: push, remove, variant creation that overwrites
 2. **Show tables for diff/list output**: format cleanly with alignment
 3. **Always use full absolute paths** when calling sync.mjs to avoid cwd issues
-4. **Default library path**: read from manifest first. Fall back to `C:/Github/claude-library`
+4. **Default library path**: resolve via `~/.claude/library-paths.json` keyed by `library_remote` from the project manifest. If unresolved, prompt the user to run `node sync.mjs --link` from their library directory.
 5. **Every project should have its own repo-primer variant**: never share another project's primer. Use the template profile for new projects until a project-specific primer is created
 6. **When editing map.json directly**: always read it fresh, modify, write back. Never assume cached state. Commit and push the library repo after map.json changes
 7. **Category detection**: if the user names an item without a category, scan library directories (`skills/`, `agents/`, `commands/`, `hooks/`, `rules/`) to find it. Check both base names and variant names

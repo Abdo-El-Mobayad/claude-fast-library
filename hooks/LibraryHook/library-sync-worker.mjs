@@ -13,6 +13,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
+import { resolveLibraryPath, formatResolutionError } from './library-path-resolver.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -55,11 +56,40 @@ async function main() {
             process.exit(0);
         }
 
-        const libraryPath = state.libraryPath;
         const projectDir = state.projectDir;
 
-        if (!libraryPath || !existsSync(libraryPath)) {
-            log('Library path not found: ' + libraryPath);
+        // v5.3 path-resolution chain: env → registry → autodetect → legacy.
+        // We re-resolve here (not at hook-fire time) so a `--link` run during
+        // the debounce window can rescue an otherwise-unresolved push.
+        const resolved = await resolveLibraryPath({
+            libraryRemote: state.libraryRemote,
+            projectDir
+        });
+
+        // Backwards-compat: state files written by pre-v5.3 hooks carry
+        // `libraryPath` (a string) instead of `libraryRemote`. Honor it as
+        // a final fallback so an in-flight migration doesn't lose pushes.
+        let libraryPath = resolved.path;
+        if (!libraryPath && typeof state.libraryPath === 'string' && state.libraryPath && existsSync(state.libraryPath)) {
+            libraryPath = state.libraryPath;
+        }
+
+        if (!libraryPath) {
+            const message = formatResolutionError(state.libraryRemote);
+            log(message);
+            // Surface the same error to /library is auto-sync working? by
+            // persisting it on the pending state instead of clearing it.
+            try {
+                writeFileSync(stateFile, JSON.stringify({
+                    timestamp: 0,
+                    file: state.file || null,
+                    libraryRemote: state.libraryRemote || null,
+                    projectDir,
+                    lastError: message
+                }), 'utf-8');
+            } catch (e) {
+                /* non-fatal */
+            }
             process.exit(0);
         }
 
@@ -85,12 +115,13 @@ async function main() {
         const lines = result.trim().split('\n').filter(l => l.trim());
         log('Push complete: ' + lines.slice(-3).join(' | '));
 
-        // Clear pending state
+        // Clear pending state (and any stale `lastError` from a prior failure)
         writeFileSync(stateFile, JSON.stringify({
             timestamp: 0,
             file: null,
-            libraryPath,
-            projectDir
+            libraryRemote: state.libraryRemote || null,
+            projectDir,
+            lastError: null
         }), 'utf-8');
 
     } catch (err) {

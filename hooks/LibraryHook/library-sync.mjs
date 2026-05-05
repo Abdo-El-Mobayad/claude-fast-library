@@ -147,12 +147,15 @@ function main() {
         if (!isManaged) process.exit(0);
 
         // Write pending sync state
+        // We persist `libraryRemote` (not the resolved local path) so the
+        // worker can re-resolve at run time. This lets autodetect / a fresh
+        // `--link` succeed even if the registry was empty when the hook fired.
         const stateFile = join(__dirname, 'pending-sync.json');
         const timestamp = Date.now();
         writeFileSync(stateFile, JSON.stringify({
             timestamp,
             file: filePath,
-            libraryPath: manifest.library_path,
+            libraryRemote: manifest.library_remote,
             projectDir
         }), 'utf-8');
 
