@@ -28,7 +28,7 @@ A central git repo (`claude-library`) holds all reusable `.claude/` content: ski
 - **Diff**: compares hashes between project and library without changing anything.
 - **Variants**: `name--suffix` convention. `react--strict` in the library deploys as `react` in the project. The manifest tracks the mapping so push sends changes back to the correct variant.
 - **Profiles**: named item selections in map.json (e.g., `dev`, `ops`, `starter`). Applied with `--init --profile`.
-- **Auto-sync**: the LibraryHook (PostToolUse + UserPromptSubmit) detects edits to managed files and auto-pushes with a 180-second debounce. No manual push needed for routine edits.
+- **Auto-sync**: the LibraryHook (Stop event) runs at the end of every Claude turn. It does a cheap mtime walk over managed files and runs `sync.mjs --push --yes` synchronously when something is newer than the last sync. No manual push needed for routine edits. No detached spawning, no platform-specific code.
 
 ### What gets synced
 
@@ -90,13 +90,25 @@ This gives them their own private copy with sync.mjs, empty category directories
 4. **Install the LibraryHook into the current project:**
 
    - Create `.claude/hooks/LibraryHook/` directory
-   - Copy the 3 hook files from `{library_path}/hooks/LibraryHook/`:
-     - `library-sync.mjs` (PostToolUse detector)
-     - `library-mtime-check.mjs` (UserPromptSubmit mtime scanner)
-     - `library-sync-worker.mjs` (180s debounced pusher)
-   - Update `.claude/settings.json`:
-     - Add to `PostToolUse` hooks array: `{"type": "command", "command": "node .claude/hooks/LibraryHook/library-sync.mjs"}`
-     - Add a new `UserPromptSubmit` entry: `{"hooks": [{"type": "command", "command": "node .claude/hooks/LibraryHook/library-mtime-check.mjs"}]}`
+   - Copy the 2 hook files from `{library_path}/hooks/LibraryHook/`:
+     - `library-sync.mjs` (Stop-event driver; mtime scan + synchronous push)
+     - `library-path-resolver.mjs` (shared helper: resolves the local library path)
+   - Update `.claude/settings.json` -- add a single `Stop` entry:
+
+     ```json
+     "Stop": [
+       {
+         "hooks": [
+           {
+             "type": "command",
+             "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/LibraryHook/library-sync.mjs\"",
+             "timeout": 30
+           }
+         ]
+       }
+     ]
+     ```
+
    - Add to `.claude/.gitignore` (create if needed): `hooks/LibraryHook/pending-sync.json`
 
 5. **Copy the /library command into the current project:**
@@ -473,10 +485,10 @@ MCP configs are stored as `mcp-configs/{name}.json` in the library. Platform var
 
 **Workflow:**
 
-1. Check if LibraryHook is registered in `.claude/settings.json` (PostToolUse + UserPromptSubmit entries)
-2. Read `.claude/hooks/LibraryHook/pending-sync.json`: timestamp > 0 means a worker is waiting
+1. Check if LibraryHook is registered in `.claude/settings.json` (single `Stop` entry pointing at `library-sync.mjs`)
+2. Read `.claude/hooks/LibraryHook/pending-sync.json`: schema is `{ "lastSyncAt": <ms>, "lastError": null|string }`. A non-null `lastError` means the most recent push attempt failed
 3. Read `.claude/hooks/LibraryHook/logs/library-sync.log` for recent push history
-4. Report: hook status (enabled/disabled), pending pushes, last successful push time
+4. Report: hook status (enabled/disabled), last sync time, last error if any
 
 ### Disable/Enable Auto-Sync
 
@@ -484,8 +496,8 @@ MCP configs are stored as `mcp-configs/{name}.json` in the library. Platform var
 
 Edit `.claude/settings.json`:
 
-- To disable: remove the LibraryHook entries from `PostToolUse` and `UserPromptSubmit` hooks
-- To enable: add them back (PostToolUse: `node .claude/hooks/LibraryHook/library-sync.mjs`, UserPromptSubmit: `node .claude/hooks/LibraryHook/library-mtime-check.mjs`)
+- To disable: remove the `Stop` entry that points at `library-sync.mjs`
+- To enable: add it back as shown in First-Time Setup step 4
 
 ---
 
