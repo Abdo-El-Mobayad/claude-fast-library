@@ -20,7 +20,7 @@ import {
 } from "fs";
 import { join, dirname, resolve } from "path";
 import { fileURLToPath } from "url";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import {
   resolveLibraryPath,
   formatResolutionError,
@@ -316,13 +316,15 @@ async function main() {
   // only fires when there's actual work to do.
   log("Auto-pushing changes to library");
   try {
-    const result = execSync(
-      `node "${syncScript}" --push --project "${projectDir}" --yes`,
+    const result = execFileSync(
+      process.execPath,
+      [syncScript, "--push", "--project", projectDir, "--yes"],
       {
         encoding: "utf-8",
         timeout: PUSH_TIMEOUT_MS,
         stdio: ["pipe", "pipe", "pipe"],
         cwd: projectDir,
+        shell: false,
       }
     );
     const lines = result.trim().split("\n").filter((l) => l.trim());

@@ -170,8 +170,7 @@ your-library/
 ├── settings/                 # settings.json files (one per project/profile)
 ├── mcp-configs/              # .mcp.json files (per project/platform)
 ├── files/                    # Arbitrary files with custom deploy paths
-├── master-skill-rules.json   # Skill activation rules (filtered per project)
-└── master-agent-rules.json   # Agent activation rules (filtered per project)
+└── master-skill-rules.json   # Skill activation rules (filtered per project)
 ```
 
 ## Technical Details

@@ -24,11 +24,11 @@ A central git repo (`claude-library`) holds all reusable `.claude/` content: ski
 **Key concepts:**
 
 - **Sync** (library to project): copies library items into the project's `.claude/` folder. Library wins.
-- **Push** (project to library): sends local edits back. Project wins. Creates a git commit in the library repo.
+- **Push** (project to library): sends local edits back. Project wins on shared files. **Additive by default: a push never deletes library files that are absent on this device** (this is what stops two devices with divergent `.claude/` trees from clobbering each other's content). Pass `--prune` (alias `--mirror`) only to make the library exactly mirror this device, propagating intentional deletions/renames. Creates a git commit in the library repo.
 - **Diff**: compares hashes between project and library without changing anything.
 - **Variants**: `name--suffix` convention. `react--strict` in the library deploys as `react` in the project. The manifest tracks the mapping so push sends changes back to the correct variant.
 - **Profiles**: named item selections in map.json (e.g., `dev`, `ops`, `starter`). Applied with `--init --profile`.
-- **Auto-sync**: the LibraryHook (Stop event) runs at the end of every Claude turn. It does a cheap mtime walk over managed files and runs `sync.mjs --push --yes` synchronously when something is newer than the last sync. No manual push needed for routine edits. No detached spawning, no platform-specific code.
+- **Auto-sync**: the LibraryHook (Stop event) runs at the end of every Claude turn. It does a cheap mtime walk over managed files and runs `sync.mjs --push --yes` synchronously when something is newer than the last sync. This auto-push is **additive and never passes `--prune`**, so an automatic sync can never delete another device's content. No manual push needed for routine edits. No detached spawning, no platform-specific code.
 
 ### What gets synced
 
@@ -44,7 +44,7 @@ A central git repo (`claude-library`) holds all reusable `.claude/` content: ski
 | mcp       | `mcp-configs/{name}.json` | `.mcp.json`                  | file      |
 | files     | `files/{name}`            | custom path from map.json    | file      |
 
-Additionally, `master-skill-rules.json` and `master-agent-rules.json` are filtered per-project during sync to produce `skill-rules.json` and `agent-rules.json`.
+Additionally, `master-skill-rules.json` is filtered per-project during sync to produce `skill-rules.json`. (Agent activation rules were retired in v5.7: the SkillActivationHook no longer recommends agents, so there is no `master-agent-rules.json` and no generated `agent-rules.json`.)
 
 ## Context Gathering
 
@@ -191,7 +191,13 @@ node {library_path}/sync.mjs --push --category {cat} --project "{cwd}"
 
 # Everything changed
 node {library_path}/sync.mjs --push --project "{cwd}" --yes
+
+# Destructive mirror: ALSO delete library files absent on this device
+# (intentional deletes/renames ONLY; never for a routine push)
+node {library_path}/sync.mjs --push --project "{cwd}" --prune --yes
 ```
+
+**Additive by default (`--prune`/`--mirror` to delete):** a normal push only adds and updates files. It never removes a library file just because it is missing on this device, and it prints `preserved N library-only file(s)` when it keeps such files. This is what prevents two devices with divergent `.claude/` trees from clobbering each other. Pass `--prune` (alias `--mirror`) ONLY when the user explicitly wants the library to exactly match this device, i.e. a real deletion or rename should propagate. If a push warns that it preserved files the user actually meant to delete, re-run the same push with `--prune`. When in doubt, do NOT prune.
 
 **Scope detection from natural language:**
 
@@ -199,6 +205,7 @@ node {library_path}/sync.mjs --push --project "{cwd}" --yes
 - "push all skills" -> `--category skills`
 - "push everything" -> no filter
 - "push the frontend agent" -> `--category agents --item frontend-specialist`
+- "delete X from the library", "mirror my device", "prune the library", "propagate the deletion" -> add `--prune` (destructive; confirm first)
 
 ---
 
@@ -315,7 +322,7 @@ This is different from "add item to project." This creates a new item IN the lib
    - **File items** (agents, commands, rules): `cp .claude/{category}/{name}.md {library_path}/{category}/{name}.md`
 3. Add it to the current project's mapping in `map.json` (read map, add to the project's array, write map)
 4. If the user wants it in a profile too, add to the profile's array in `map.json`
-5. If the item has keyword triggers, add entries to `{library_path}/master-skill-rules.json` or `master-agent-rules.json`
+5. If the item has keyword triggers, add entries to `{library_path}/master-skill-rules.json`
 6. Run sync to update the manifest:
 
 ```bash
@@ -520,7 +527,7 @@ If manifest is missing entirely, suggest: `/library seed` (to import existing pr
 
 ## Rules
 
-1. **Confirm before destructive operations**: push, remove, variant creation that overwrites
+1. **Confirm before destructive operations**: `push --prune`/`--mirror` (deletes library files absent on this device), remove, variant creation that overwrites. A plain push is additive (adds/updates only, never deletes) and is safe to run without prune.
 2. **Show tables for diff/list output**: format cleanly with alignment
 3. **Always use full absolute paths** when calling sync.mjs to avoid cwd issues
 4. **Default library path**: resolve via `~/.claude/library-paths.json` keyed by `library_remote` from the project manifest. If unresolved, prompt the user to run `node sync.mjs --link` from their library directory.

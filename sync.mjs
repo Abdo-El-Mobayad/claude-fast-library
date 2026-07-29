@@ -70,7 +70,7 @@ function deleteItem(itemPath) {
 
 const IGNORE = ['logs', 'node_modules', '.DS_Store', 'Thumbs.db'];
 const IGNORE_EXT = ['.log'];
-const IGNORE_FILES = ['recommendation-log.json', 'skill-rules.json', 'agent-rules.json', '.syncignore', 'pending-sync.json'];
+const IGNORE_FILES = ['recommendation-log.json', 'skill-rules.json', 'agent-rules.json', '.syncignore', 'pending-sync.json', 'pushback-state.json'];
 
 function shouldIgnore(name) {
   if (IGNORE.includes(name)) return true;
@@ -256,7 +256,9 @@ function syncProject(projectRoot, map) {
         continue;
       }
 
-      if (DIR_CATEGORIES.includes(cat)) pushDirSyncIgnoreAware(src, dest, getIgnorePatterns(full, map.ignore));
+      // Deploy is library -> project: library is the source of truth, so mirror
+      // (prune=true) to remove files deleted upstream.
+      if (DIR_CATEGORIES.includes(cat)) pushDirSyncIgnoreAware(src, dest, getIgnorePatterns(full, map.ignore), true);
       else copyFile(src, dest);
 
       managed[cat][deploy] = full;
@@ -314,8 +316,8 @@ function syncProject(projectRoot, map) {
     const marker = '# claude-library managed';
     const missing = gitignoreLines.filter(line => !existing.includes(line));
     if (missing.length) {
-      const block = existing.includes(marker) ? '' : '\n' + marker + '\n';
-      const append = block + missing.join('\n') + '\n';
+      const markerLine = existing.includes(marker) ? '' : marker + '\n';
+      const append = '\n' + markerLine + missing.join('\n') + '\n';
       writeFileSync(giPath, existing.trimEnd() + append);
       console.log(`  Appended ${missing.length} lines to .gitignore`);
     }
@@ -370,6 +372,7 @@ function syncProject(projectRoot, map) {
     library_commit: getLibCommit(),
     managed
   };
+  manifest.base_hashes = computeBaseHashes(projectRoot, manifest);
   writeJSON(mPath, manifest);
 
   // Remove legacy manifest if it still exists (one-time migration)
@@ -552,14 +555,35 @@ function copyDirFiltered(src, dest, srcRoot, patterns) {
   }
 }
 
-function pushDirSyncIgnoreAware(src, dest, patterns = []) {
-  if (!patterns.length) {
-    if (existsSync(dest)) rmSync(dest, { recursive: true, force: true });
-    copyDir(src, dest);
+// Files present in dest but absent from src (respecting ignore rules). A
+// destructive mirror would delete these; an additive push preserves them.
+function findDestOnly(src, dest, patterns = []) {
+  if (!existsSync(dest)) return [];
+  return getAllFiles(dest, dest, patterns)
+    .map(f => norm(relative(dest, f)))
+    .filter(rel => !existsSync(join(src, rel)));
+}
+
+// Push a directory item (project -> library, or library -> project on deploy).
+//   prune=false (default): ADDITIVE. Overlay src onto dest; never delete files
+//     that exist in dest but are absent from src. This is the safe default that
+//     stops one device from clobbering another's content when two devices have
+//     divergent .claude/ trees (the multi-device divergence class of bug).
+//   prune=true (--prune/--mirror, and always on deploy): destructive mirror,
+//     dest becomes an exact copy of src. Use only for intentional deletes/renames.
+function pushDirSyncIgnoreAware(src, dest, patterns = [], prune = false) {
+  if (prune) {
+    if (!patterns.length) {
+      if (existsSync(dest)) rmSync(dest, { recursive: true, force: true });
+      copyDir(src, dest);
+    } else {
+      if (existsSync(dest)) deleteNonIgnored(dest, dest, patterns);
+      copyDirFiltered(src, dest, src, patterns);
+    }
     return;
   }
-  if (existsSync(dest)) deleteNonIgnored(dest, dest, patterns);
-  copyDirFiltered(src, dest, src, patterns);
+  if (patterns.length) copyDirFiltered(src, dest, src, patterns);
+  else copyDir(src, dest);
 }
 
 // ── Change Detection ────────────────────────────────────────────────────────
@@ -609,6 +633,46 @@ function getChangedItems(projectRoot) {
   return changed;
 }
 
+function itemPaths(projectRoot, manifest, item) {
+  const ignoreMap = manifest.managed.ignore || {};
+  if (CATEGORIES.includes(item.category)) {
+    return {
+      src: projItemPath(projectRoot, item.category, item.deploy),
+      dest: libItemPath(item.category, item.full),
+      patterns: DIR_CATEGORIES.includes(item.category) ? (ignoreMap[item.deploy] || []) : []
+    };
+  }
+  if (item.category === 'claude-md') return { src: join(projectRoot, 'CLAUDE.md'), dest: join(LIB, 'claude-mds', item.full + '.md'), patterns: [] };
+  if (item.category === 'settings') return { src: join(projectRoot, '.claude', 'settings.json'), dest: join(LIB, 'settings', item.full + '.json'), patterns: [] };
+  if (item.category === 'mcp') return { src: join(projectRoot, '.mcp.json'), dest: join(LIB, 'mcp-configs', item.full + '.json'), patterns: [] };
+  if (item.category === 'files') return { src: join(projectRoot, item.deploy), dest: join(LIB, 'files', item.full), patterns: [] };
+  return null;
+}
+
+function computeBaseHashes(projectRoot, manifest) {
+  // Records the agreed two-sided state ({proj, lib} hash per item) after a
+  // sync or push, so a later push can detect both-sides-changed divergence
+  // instead of silently clobbering a library item with a stale local copy.
+  const hashes = {};
+  const managed = manifest.managed;
+  const items = [];
+  for (const cat of CATEGORIES) {
+    for (const [deploy, full] of Object.entries(managed[cat] || {})) items.push({ category: cat, deploy, full });
+  }
+  if (managed['claude-md']) items.push({ category: 'claude-md', deploy: 'CLAUDE.md', full: managed['claude-md'] });
+  if (managed.settings) items.push({ category: 'settings', deploy: 'settings.json', full: managed.settings });
+  if (managed.mcp) items.push({ category: 'mcp', deploy: '.mcp.json', full: managed.mcp });
+  for (const [libName, deployPath] of Object.entries(managed.files || {})) items.push({ category: 'files', deploy: deployPath, full: libName });
+  for (const item of items) {
+    const p = itemPaths(projectRoot, manifest, item);
+    if (!p) continue;
+    const proj = hashPath(p.src, p.patterns);
+    const lib = hashPath(p.dest, p.patterns);
+    if (proj || lib) hashes[`${item.category}/${item.full}`] = { proj, lib };
+  }
+  return hashes;
+}
+
 function confirm(message) {
   if (!process.stdin.isTTY) return Promise.resolve(true);
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -622,7 +686,7 @@ function confirm(message) {
 
 // ── PUSH (project -> library) ────────────────────────────────────────────────
 
-async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm) {
+async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm, prune = false) {
   const mPath = resolveManifestPath(projectRoot);
   if (!existsSync(mPath)) { console.error('  No manifest. Run sync first.'); process.exit(1); }
   const manifest = readJSON(mPath);
@@ -638,6 +702,35 @@ async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm)
     if (itemFilter) {
       toPush = toPush.filter(i => i.deploy === itemFilter || i.full === itemFilter);
     }
+  }
+
+  // Divergence guard: refuse to overwrite a library item that moved since this
+  // project's last sync when this project's copy also moved (both sides changed
+  // means stale-base clobber risk). An explicit --item push bypasses the guard
+  // and is the documented force path.
+  const baseHashes = manifest.base_hashes || {};
+  const conflicts = [];
+  if (!itemFilter) {
+    toPush = toPush.filter(item => {
+      const base = baseHashes[`${item.category}/${item.full}`];
+      if (!base || !base.lib) return true;
+      const p = itemPaths(projectRoot, manifest, item);
+      if (!p) return true;
+      const libHash = hashPath(p.dest, p.patterns);
+      const projHash = hashPath(p.src, p.patterns);
+      if (!libHash) return true;
+      if (libHash !== base.lib && projHash !== base.proj) {
+        conflicts.push(item);
+        return false;
+      }
+      return true;
+    });
+  }
+  if (conflicts.length) {
+    console.log('\n  CONFLICT: both sides changed since this project last synced. Skipped:');
+    for (const c of conflicts) console.log(`    ${c.category}/${c.deploy}`);
+    console.log('  Resolve per item: run a plain sync to take the library version,');
+    console.log("  or push --category <cat> --item <name> to force this device's version.");
   }
 
   if (!toPush.length) {
@@ -667,7 +760,17 @@ async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm)
       if (!existsSync(src)) continue;
 
       if (DIR_CATEGORIES.includes(item.category)) {
-        pushDirSyncIgnoreAware(src, dest, ignoreMap[item.deploy] || []);
+        const patterns = ignoreMap[item.deploy] || [];
+        if (!prune) {
+          const preserved = findDestOnly(src, dest, patterns);
+          if (preserved.length) {
+            console.log(`    preserved ${preserved.length} library-only file(s) under ${item.category}/${item.deploy} (absent on this device):`);
+            for (const rel of preserved.slice(0, 10)) console.log(`      + ${rel}`);
+            if (preserved.length > 10) console.log(`      ... and ${preserved.length - 10} more`);
+            console.log(`      run with --prune if these deletions are intentional`);
+          }
+        }
+        pushDirSyncIgnoreAware(src, dest, patterns, prune);
       } else {
         copyFile(src, dest);
       }
@@ -698,6 +801,20 @@ async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm)
       console.log(`  Merged ${rulePushed} rule file(s) into master`);
       pushed += rulePushed;
     }
+  }
+
+  // Record the new agreed two-sided state for pushed items
+  if (pushed) {
+    const bh = manifest.base_hashes || {};
+    for (const item of toPush) {
+      const p = itemPaths(projectRoot, manifest, item);
+      if (!p) continue;
+      const proj = hashPath(p.src, p.patterns);
+      const lib = hashPath(p.dest, p.patterns);
+      if (proj || lib) bh[`${item.category}/${item.full}`] = { proj, lib };
+    }
+    manifest.base_hashes = bh;
+    writeJSON(mPath, manifest);
   }
 
   const name = basename(projectRoot);
@@ -1150,7 +1267,7 @@ function parseArgs() {
     command: 'sync', project: null, all: false,
     from: null, name: null, profile: null,
     category: null, item: null, deployPath: null,
-    yes: false
+    yes: false, prune: false
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -1170,6 +1287,7 @@ function parseArgs() {
       case '--category': parsed.category = args[++i]; break;
       case '--item': parsed.item = args[++i]; break;
       case '--yes': case '-y': parsed.yes = true; break;
+      case '--prune': case '--mirror': parsed.prune = true; break;
       case '--add':
         parsed.command = 'add';
         parsed.category = args[++i];
@@ -1208,6 +1326,7 @@ function printUsage() {
     --push --category <cat>           Push all changed items in a category
     --push --category <cat> --item <name>  Push a single changed item
     --push -y                         Push all changed items without confirmation
+    --push --prune                    Push AND delete library files absent locally (destructive mirror; for intentional deletes/renames)
     --diff                            Show sync status
     --list                            List projects, profiles, items, and variants
     --add <cat> <name> [deploy-path]  Add item to current project
@@ -1224,6 +1343,8 @@ function printUsage() {
     --category <cat>    Filter push by category (skills, agents, commands, hooks, rules)
     --item <name>       Filter push by item name (requires --category)
     --yes, -y           Skip confirmation prompt
+    --prune, --mirror   Let push delete library files that are absent on this device
+                        (default push is additive and never deletes; it warns instead)
     --profile <name>    Use a named profile (with --init)
     --from <path>       Copy config from another project (with --init)
     --name <slug>       Slug for claude-md/settings/mcp (with --seed)
@@ -1283,7 +1404,7 @@ async function main() {
       }
       break;
     case 'push':
-      await pushProject(projectRoot, args.category, args.item, args.yes);
+      await pushProject(projectRoot, args.category, args.item, args.yes, args.prune);
       break;
     case 'diff':
       diffProject(projectRoot);
