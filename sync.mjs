@@ -704,27 +704,42 @@ async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm,
     }
   }
 
-  // Divergence guard: refuse to overwrite a library item that moved since this
-  // project's last sync when this project's copy also moved (both sides changed
-  // means stale-base clobber risk). An explicit --item push bypasses the guard
-  // and is the documented force path.
+  // Divergence guard, three-way against base_hashes (the agreed state at this
+  // project's last sync). A hash mismatch alone does NOT mean this project has
+  // something to contribute: it can equally mean this project is STALE and the
+  // library moved on without it. Pushing in that case overwrites newer library
+  // content with an older copy, which is the multi-device clobber class.
+  //
+  //   project unchanged + library moved  -> stale, skip (a sync resolves it)
+  //   project changed   + library moved  -> genuine conflict, skip
+  //   project changed   + library same   -> normal push
+  //
+  // An explicit --item push bypasses the guard and is the documented force path.
   const baseHashes = manifest.base_hashes || {};
   const conflicts = [];
+  const stale = [];
   if (!itemFilter) {
     toPush = toPush.filter(item => {
       const base = baseHashes[`${item.category}/${item.full}`];
+      // No recorded base (manifest predates base_hashes): cannot reason about
+      // direction, so fall back to pushing. Run a sync once to establish a base.
       if (!base || !base.lib) return true;
       const p = itemPaths(projectRoot, manifest, item);
       if (!p) return true;
       const libHash = hashPath(p.dest, p.patterns);
       const projHash = hashPath(p.src, p.patterns);
       if (!libHash) return true;
-      if (libHash !== base.lib && projHash !== base.proj) {
-        conflicts.push(item);
-        return false;
-      }
+      const projAuthored = projHash !== base.proj;
+      const libMoved = libHash !== base.lib;
+      if (libMoved && !projAuthored) { stale.push(item); return false; }
+      if (libMoved && projAuthored) { conflicts.push(item); return false; }
       return true;
     });
+  }
+  if (stale.length) {
+    console.log('\n  STALE (library moved on, nothing authored here). Not pushed:');
+    for (const s of stale) console.log(`    ${s.category}/${s.deploy}`);
+    console.log('  Run a plain sync to bring this project up to date.');
   }
   if (conflicts.length) {
     console.log('\n  CONFLICT: both sides changed since this project last synced. Skipped:');
