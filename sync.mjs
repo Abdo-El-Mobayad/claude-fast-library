@@ -186,6 +186,16 @@ function getLibCommit() {
   catch { return 'none'; }
 }
 
+function isLibCommitAncestor(commit) {
+  if (!/^[0-9a-f]{7,40}$/i.test(commit || '')) return null;
+  try {
+    execSync(`git merge-base --is-ancestor ${commit} HEAD`, { cwd: LIB, stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function getLibRemote() {
   try { return execSync('git remote get-url origin', { cwd: LIB, encoding: 'utf8' }).trim(); }
   catch { return ''; }
@@ -673,6 +683,30 @@ function computeBaseHashes(projectRoot, manifest) {
   return hashes;
 }
 
+function checkPushPrecondition(projectRoot, manifest, item) {
+  const paths = itemPaths(projectRoot, manifest, item);
+  if (!paths) return { ok: false, reason: 'unresolved-path' };
+
+  const base = (manifest.base_hashes || {})[`${item.category}/${item.full}`];
+  const libHash = hashPath(paths.dest, paths.patterns);
+  const hasCompleteBase = base
+    && Object.prototype.hasOwnProperty.call(base, 'proj')
+    && Object.prototype.hasOwnProperty.call(base, 'lib');
+
+  // A missing base is safe only when the destination is also missing. That is
+  // a genuinely new library item. If the destination exists, the manifest is
+  // legacy or incomplete and there is no safe expected value to compare.
+  if (!hasCompleteBase) {
+    return libHash === null
+      ? { ok: true, reason: null }
+      : { ok: false, reason: 'missing-base' };
+  }
+
+  const projHash = hashPath(paths.src, paths.patterns);
+  if (libHash === base.lib) return { ok: true, reason: null };
+  return { ok: false, reason: projHash === base.proj ? 'stale' : 'conflict' };
+}
+
 function confirm(message) {
   if (!process.stdin.isTTY) return Promise.resolve(true);
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -686,11 +720,25 @@ function confirm(message) {
 
 // ── PUSH (project -> library) ────────────────────────────────────────────────
 
-async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm, prune = false) {
+async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm, prune = false, force = false) {
   const mPath = resolveManifestPath(projectRoot);
   if (!existsSync(mPath)) { console.error('  No manifest. Run sync first.'); process.exit(1); }
   const manifest = readJSON(mPath);
   const ignoreMap = manifest.managed.ignore || {};
+
+  if (force && (!categoryFilter || !itemFilter)) {
+    console.error('  --force requires --category <cat> --item <name>.');
+    process.exitCode = 1;
+    return;
+  }
+
+  const ancestor = isLibCommitAncestor(manifest.library_commit);
+  if (!force && ancestor === false) {
+    console.error(`  REFUSED: manifest library_commit ${manifest.library_commit} is not an ancestor of library HEAD.`);
+    console.error('  Sync first, or use a targeted --force only for a deliberate rollback.');
+    process.exitCode = 1;
+    return;
+  }
 
   // Detect changed items
   const allChanged = getChangedItems(projectRoot);
@@ -704,37 +752,29 @@ async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm,
     }
   }
 
-  // Divergence guard, three-way against base_hashes (the agreed state at this
-  // project's last sync). A hash mismatch alone does NOT mean this project has
-  // something to contribute: it can equally mean this project is STALE and the
-  // library moved on without it. Pushing in that case overwrites newer library
-  // content with an older copy, which is the multi-device clobber class.
-  //
-  //   project unchanged + library moved  -> stale, skip (a sync resolves it)
-  //   project changed   + library moved  -> genuine conflict, skip
-  //   project changed   + library same   -> normal push
-  //
-  // An explicit --item push bypasses the guard and is the documented force path.
-  const baseHashes = manifest.base_hashes || {};
+  // Preflight every selected item. --item narrows the selection but does not
+  // weaken the compare-and-swap precondition. Only a targeted --force bypasses
+  // it for a deliberate rollback.
   const conflicts = [];
   const stale = [];
-  if (!itemFilter) {
+  const missingBase = [];
+  const unresolved = [];
+  if (!force) {
     toPush = toPush.filter(item => {
-      const base = baseHashes[`${item.category}/${item.full}`];
-      // No recorded base (manifest predates base_hashes): cannot reason about
-      // direction, so fall back to pushing. Run a sync once to establish a base.
-      if (!base || !base.lib) return true;
-      const p = itemPaths(projectRoot, manifest, item);
-      if (!p) return true;
-      const libHash = hashPath(p.dest, p.patterns);
-      const projHash = hashPath(p.src, p.patterns);
-      if (!libHash) return true;
-      const projAuthored = projHash !== base.proj;
-      const libMoved = libHash !== base.lib;
-      if (libMoved && !projAuthored) { stale.push(item); return false; }
-      if (libMoved && projAuthored) { conflicts.push(item); return false; }
-      return true;
+      const result = checkPushPrecondition(projectRoot, manifest, item);
+      if (result.ok) return true;
+      if (result.reason === 'stale') stale.push(item);
+      else if (result.reason === 'conflict') conflicts.push(item);
+      else if (result.reason === 'missing-base') missingBase.push(item);
+      else unresolved.push(item);
+      return false;
     });
+  }
+
+  if (missingBase.length) {
+    console.log('\n  NO BASE: library item exists but this project has no complete base. Skipped:');
+    for (const item of missingBase) console.log(`    ${item.category}/${item.deploy}`);
+    console.log('  Sync to adopt the library state, or use a targeted --force for a deliberate rollback.');
   }
   if (stale.length) {
     console.log('\n  STALE (library moved on, nothing authored here). Not pushed:');
@@ -745,7 +785,11 @@ async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm,
     console.log('\n  CONFLICT: both sides changed since this project last synced. Skipped:');
     for (const c of conflicts) console.log(`    ${c.category}/${c.deploy}`);
     console.log('  Resolve per item: run a plain sync to take the library version,');
-    console.log("  or push --category <cat> --item <name> to force this device's version.");
+    console.log("  or add --force to a targeted push to take this device's version.");
+  }
+  if (unresolved.length) {
+    console.error('\n  ERROR: could not resolve paths for these items. Skipped:');
+    for (const item of unresolved) console.error(`    ${item.category}/${item.deploy}`);
   }
 
   if (!toPush.length) {
@@ -767,50 +811,41 @@ async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm,
   }
 
   let pushed = 0;
+  const pushedItems = [];
 
   for (const item of toPush) {
-    if (CATEGORIES.includes(item.category)) {
-      const src = projItemPath(projectRoot, item.category, item.deploy);
-      const dest = libItemPath(item.category, item.full);
-      if (!existsSync(src)) continue;
+    const paths = itemPaths(projectRoot, manifest, item);
+    if (!paths || !existsSync(paths.src)) continue;
 
-      if (DIR_CATEGORIES.includes(item.category)) {
-        const patterns = ignoreMap[item.deploy] || [];
-        if (!prune) {
-          const preserved = findDestOnly(src, dest, patterns);
-          if (preserved.length) {
-            console.log(`    preserved ${preserved.length} library-only file(s) under ${item.category}/${item.deploy} (absent on this device):`);
-            for (const rel of preserved.slice(0, 10)) console.log(`      + ${rel}`);
-            if (preserved.length > 10) console.log(`      ... and ${preserved.length - 10} more`);
-            console.log(`      run with --prune if these deletions are intentional`);
-          }
-        }
-        pushDirSyncIgnoreAware(src, dest, patterns, prune);
-      } else {
-        copyFile(src, dest);
+    // Re-check immediately before the write. A concurrent push may have moved
+    // the library after preflight or while the confirmation prompt was open.
+    if (!force) {
+      const result = checkPushPrecondition(projectRoot, manifest, item);
+      if (!result.ok) {
+        console.log(`    SKIP: ${item.category}/${item.deploy} (precondition changed: ${result.reason})`);
+        continue;
       }
-      pushed++;
-    } else if (item.category === 'claude-md') {
-      const src = join(projectRoot, 'CLAUDE.md');
-      const dest = join(LIB, 'claude-mds', item.full + '.md');
-      if (existsSync(src)) { copyFile(src, dest); pushed++; }
-    } else if (item.category === 'settings') {
-      const src = join(projectRoot, '.claude', 'settings.json');
-      const dest = join(LIB, 'settings', item.full + '.json');
-      if (existsSync(src)) { copyFile(src, dest); pushed++; }
-    } else if (item.category === 'mcp') {
-      const src = join(projectRoot, '.mcp.json');
-      const dest = join(LIB, 'mcp-configs', item.full + '.json');
-      if (existsSync(src)) { copyFile(src, dest); pushed++; }
-    } else if (item.category === 'files') {
-      const src = join(projectRoot, item.deploy);
-      const dest = join(LIB, 'files', item.full);
-      if (existsSync(src)) { copyFile(src, dest); pushed++; }
     }
+
+    if (DIR_CATEGORIES.includes(item.category)) {
+      if (!prune) {
+        const preserved = findDestOnly(paths.src, paths.dest, paths.patterns);
+        if (preserved.length) {
+          console.log(`    preserved ${preserved.length} library-only file(s) under ${item.category}/${item.deploy} (absent on this device):`);
+          for (const rel of preserved.slice(0, 10)) console.log(`      + ${rel}`);
+          if (preserved.length > 10) console.log(`      ... and ${preserved.length - 10} more`);
+          console.log(`      run with --prune if these deletions are intentional`);
+        }
+      }
+      pushDirSyncIgnoreAware(paths.src, paths.dest, paths.patterns, prune);
+    } else copyFile(paths.src, paths.dest);
+
+    pushed++;
+    pushedItems.push(item);
   }
 
   // Push rule files if pushing skills
-  if (!categoryFilter || categoryFilter === 'skills') {
+  if (pushedItems.length && (!categoryFilter || categoryFilter === 'skills')) {
     const rulePushed = pushRuleFiles(projectRoot);
     if (rulePushed) {
       console.log(`  Merged ${rulePushed} rule file(s) into master`);
@@ -819,13 +854,13 @@ async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm,
   }
 
   // Record the new agreed two-sided state for pushed items
-  if (pushed) {
+  if (pushedItems.length) {
     const bh = manifest.base_hashes || {};
-    for (const item of toPush) {
-      const p = itemPaths(projectRoot, manifest, item);
-      if (!p) continue;
-      const proj = hashPath(p.src, p.patterns);
-      const lib = hashPath(p.dest, p.patterns);
+    for (const item of pushedItems) {
+      const paths = itemPaths(projectRoot, manifest, item);
+      if (!paths) continue;
+      const proj = hashPath(paths.src, paths.patterns);
+      const lib = hashPath(paths.dest, paths.patterns);
       if (proj || lib) bh[`${item.category}/${item.full}`] = { proj, lib };
     }
     manifest.base_hashes = bh;
@@ -1260,12 +1295,14 @@ function seedProject(projectRoot, name, map) {
     }
   }
 
-  writeJSON(manifestPath(projectRoot), {
+  const manifest = {
     library_remote: getLibRemote(),
     synced_at: new Date().toISOString(),
     library_commit: getLibCommit(),
     managed
-  });
+  };
+  manifest.base_hashes = computeBaseHashes(projectRoot, manifest);
+  writeJSON(manifestPath(projectRoot), manifest);
 
   // Merge any existing rule files into master
   pushRuleFiles(projectRoot);
@@ -1282,7 +1319,7 @@ function parseArgs() {
     command: 'sync', project: null, all: false,
     from: null, name: null, profile: null,
     category: null, item: null, deployPath: null,
-    yes: false, prune: false
+    yes: false, prune: false, force: false
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -1303,6 +1340,7 @@ function parseArgs() {
       case '--item': parsed.item = args[++i]; break;
       case '--yes': case '-y': parsed.yes = true; break;
       case '--prune': case '--mirror': parsed.prune = true; break;
+      case '--force': parsed.force = true; break;
       case '--add':
         parsed.command = 'add';
         parsed.category = args[++i];
@@ -1342,6 +1380,7 @@ function printUsage() {
     --push --category <cat> --item <name>  Push a single changed item
     --push -y                         Push all changed items without confirmation
     --push --prune                    Push AND delete library files absent locally (destructive mirror; for intentional deletes/renames)
+    --push --category <cat> --item <name> --force  Deliberately overwrite a moved library item
     --diff                            Show sync status
     --list                            List projects, profiles, items, and variants
     --add <cat> <name> [deploy-path]  Add item to current project
@@ -1360,6 +1399,8 @@ function printUsage() {
     --yes, -y           Skip confirmation prompt
     --prune, --mirror   Let push delete library files that are absent on this device
                         (default push is additive and never deletes; it warns instead)
+    --force             Bypass the item hash precondition for a deliberate rollback
+                        (requires --category and --item)
     --profile <name>    Use a named profile (with --init)
     --from <path>       Copy config from another project (with --init)
     --name <slug>       Slug for claude-md/settings/mcp (with --seed)
@@ -1384,6 +1425,7 @@ function printUsage() {
 async function main() {
   const args = parseArgs();
   const projectRoot = args.project ? resolve(args.project) : process.cwd();
+  let pushPullFailed = false;
 
   console.log(`\n  claude-library sync`);
   console.log(`  library: ${norm(LIB)}`);
@@ -1391,7 +1433,9 @@ async function main() {
   // Pull latest before operations that read from library
   if (['sync', 'diff', 'push'].includes(args.command)) {
     process.stdout.write('  pulling latest... ');
-    gitPull() ? console.log('done') : console.log('skipped');
+    const pulled = gitPull();
+    pulled ? console.log('done') : console.log('skipped');
+    pushPullFailed = args.command === 'push' && Boolean(getLibRemote()) && !pulled;
   }
 
   const map = readMap();
@@ -1419,7 +1463,12 @@ async function main() {
       }
       break;
     case 'push':
-      await pushProject(projectRoot, args.category, args.item, args.yes, args.prune);
+      if (pushPullFailed) {
+        console.error('  REFUSED: git pull --ff-only failed; library freshness is unknown.');
+        process.exitCode = 1;
+        break;
+      }
+      await pushProject(projectRoot, args.category, args.item, args.yes, args.prune, args.force);
       break;
     case 'diff':
       diffProject(projectRoot);
