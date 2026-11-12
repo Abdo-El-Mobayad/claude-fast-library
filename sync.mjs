@@ -383,6 +383,7 @@ function syncProject(projectRoot, map) {
     managed
   };
   manifest.base_hashes = computeBaseHashes(projectRoot, manifest);
+  manifest.rule_base = computeRuleBase(projectRoot);
   writeJSON(mPath, manifest);
 
   // Remove legacy manifest if it still exists (one-time migration)
@@ -470,8 +471,90 @@ function generateRuleFiles(projectRoot, config) {
   return generated;
 }
 
-function pushRuleFiles(projectRoot) {
+// ── Rule bases ───────────────────────────────────────────────────────────────
+// skill-rules.json is generated per project from master-skill-rules.json, and a
+// push merges it back. That merge used to copy every rule that differed over
+// the master with no check of which side was newer, so a project holding an
+// older copy undid a newer master rule on its next push of anything. A rule
+// now follows the same compare-and-swap idea as an item: the
+// manifest records, per skill, the hash the master's rule had when this project
+// last agreed with it (`rule_base.skills`), and a push leaves the master alone
+// when the master has moved since then.
+
+function ruleHash(rule) {
+  return createHash('md5').update(JSON.stringify(rule)).digest('hex');
+}
+
+// The base for every skill whose rule is the same here and in the master right
+// now. A skill that differs gets no entry: writing the master's hash for it
+// would make the next push read a stale local copy as this project's own edit.
+function computeRuleBase(projectRoot) {
+  const base = { skills: {} };
+  const skillRulesPath = join(projectRoot, '.claude', 'skills', 'skill-rules.json');
+  const masterSkillsPath = join(LIB, 'master-skill-rules.json');
+  if (!existsSync(skillRulesPath) || !existsSync(masterSkillsPath)) return base;
+  try {
+    const local = readJSON(skillRulesPath);
+    const master = readJSON(masterSkillsPath);
+    for (const [name, rule] of Object.entries(local.skills || {})) {
+      if (!master.skills?.[name]) continue;
+      const hash = ruleHash(rule);
+      if (hash === ruleHash(master.skills[name])) base.skills[name] = hash;
+    }
+  } catch {}
+  return base;
+}
+
+// Every hash each skill's rule has had in the master's git history. Used only
+// for a skill this project has no base for (a manifest written before rule
+// bases existed): a local rule equal to an earlier master version is a stale
+// copy, not an edit. Null when the history cannot be read.
+let masterRuleHistoryCache;
+function masterRuleHistory() {
+  if (masterRuleHistoryCache !== undefined) return masterRuleHistoryCache;
+  masterRuleHistoryCache = null;
+  try {
+    const quiet = { cwd: LIB, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 };
+    const revs = execSync('git log --format=%H -- master-skill-rules.json', quiet)
+      .split('\n').map(line => line.trim()).filter(Boolean);
+    const seen = new Map();
+    for (const rev of revs) {
+      let parsed;
+      try { parsed = JSON.parse(execSync(`git show ${rev}:master-skill-rules.json`, quiet)); } catch { continue; }
+      for (const [name, rule] of Object.entries(parsed.skills || {})) {
+        if (!seen.has(name)) seen.set(name, new Set());
+        seen.get(name).add(ruleHash(rule));
+      }
+    }
+    if (revs.length) masterRuleHistoryCache = seen;
+  } catch {}
+  return masterRuleHistoryCache;
+}
+
+// What to do with one skill's rule that differs from the master's.
+//   push      the master has no rule for it, or only this project changed it
+//   stale     the master moved and this project did not: keep the master
+//   conflict  both moved since the last sync: keep the master
+//   no-base   no base and no readable history: keep the master
+function ruleDecision(name, localHash, masterHash, manifest, forceNames) {
+  if (masterHash === null) return 'push';
+  if (forceNames && forceNames.has(name)) return 'push';
+  const base = manifest?.rule_base?.skills?.[name];
+  if (typeof base === 'string') {
+    if (masterHash === base) return 'push';
+    return localHash === base ? 'stale' : 'conflict';
+  }
+  const history = masterRuleHistory();
+  if (!history) return 'no-base';
+  return history.get(name)?.has(localHash) ? 'stale' : 'push';
+}
+
+// Returns { pushed, skills, hashes, stale, conflicts, noBase }: how many master
+// rule files were written, the skills whose rule went in (with the hash each
+// now has in the master), and the skills whose master rule was kept and why.
+function pushRuleFiles(projectRoot, manifest = null, forceNames = null) {
   let pushed = 0;
+  const result = { pushed: 0, skills: [], hashes: {}, stale: [], conflicts: [], noBase: [] };
 
   // Push skill-rules.json changes back to master
   const skillRulesPath = join(projectRoot, '.claude', 'skills', 'skill-rules.json');
@@ -479,21 +562,31 @@ function pushRuleFiles(projectRoot) {
   if (existsSync(skillRulesPath) && existsSync(masterSkillsPath)) {
     const local = readJSON(skillRulesPath);
     const master = readJSON(masterSkillsPath);
+    if (!master.skills) master.skills = {};
     let changed = false;
     for (const [name, rules] of Object.entries(local.skills || {})) {
-      const localHash = createHash('md5').update(JSON.stringify(rules)).digest('hex');
-      const masterHash = master.skills[name] ? createHash('md5').update(JSON.stringify(master.skills[name])).digest('hex') : null;
-      if (localHash !== masterHash) {
+      const localHash = ruleHash(rules);
+      const masterHash = master.skills[name] ? ruleHash(master.skills[name]) : null;
+      if (localHash === masterHash) continue;
+      const decision = ruleDecision(name, localHash, masterHash, manifest, forceNames);
+      if (decision === 'push') {
         master.skills[name] = rules;
         changed = true;
-      }
+        result.skills.push(name);
+        result.hashes[name] = localHash;
+      } else if (decision === 'stale') result.stale.push(name);
+      else if (decision === 'conflict') result.conflicts.push(name);
+      else result.noBase.push(name);
     }
-    // Also merge skill_overview
+    // Also merge skill_overview, for a skill whose rule just went in or one the
+    // master has no overview for. An overview beside a kept master rule stays.
     if (local.notes?.skill_overview) {
       if (!master.notes) master.notes = {};
       if (!master.notes.skill_overview) master.notes.skill_overview = {};
       for (const [name, overview] of Object.entries(local.notes.skill_overview)) {
-        master.notes.skill_overview[name] = overview;
+        if (result.skills.includes(name) || master.notes.skill_overview[name] === undefined) {
+          master.notes.skill_overview[name] = overview;
+        }
       }
     }
     if (changed) {
@@ -530,7 +623,8 @@ function pushRuleFiles(projectRoot) {
     }
   }
 
-  return pushed;
+  result.pushed = pushed;
+  return result;
 }
 
 // ── Filtered Directory Push ──────────────────────────────────────────────────
@@ -846,10 +940,28 @@ async function pushProject(projectRoot, categoryFilter, itemFilter, skipConfirm,
 
   // Push rule files if pushing skills
   if (pushedItems.length && (!categoryFilter || categoryFilter === 'skills')) {
-    const rulePushed = pushRuleFiles(projectRoot);
-    if (rulePushed) {
-      console.log(`  Merged ${rulePushed} rule file(s) into master`);
-      pushed += rulePushed;
+    const forceNames = force && categoryFilter === 'skills' && itemFilter ? new Set([itemFilter]) : null;
+    const rules = pushRuleFiles(projectRoot, manifest, forceNames);
+    if (rules.pushed) {
+      console.log(`  Merged ${rules.pushed} rule file(s) into master`);
+      pushed += rules.pushed;
+    }
+    if (rules.stale.length) {
+      console.log(`  Kept the master's skill triggers (the library moved on, nothing authored here): ${rules.stale.join(', ')}`);
+      console.log('  Run a plain sync to bring this project up to date.');
+    }
+    if (rules.conflicts.length) {
+      console.log(`  CONFLICT: skill triggers changed on both sides since this project last synced. Kept the master: ${rules.conflicts.join(', ')}`);
+      console.log("  Run a plain sync to take the master, or push with --category skills --item <skill> --force to take this device's.");
+    }
+    if (rules.noBase.length) {
+      console.log(`  NO BASE: skill triggers differ and there is no base or history to judge by. Kept the master: ${rules.noBase.join(', ')}`);
+    }
+    if (rules.skills.length) {
+      const rb = manifest.rule_base && typeof manifest.rule_base === 'object' ? manifest.rule_base : {};
+      rb.skills = rb.skills && typeof rb.skills === 'object' ? rb.skills : {};
+      for (const name of rules.skills) rb.skills[name] = rules.hashes[name];
+      manifest.rule_base = rb;
     }
   }
 
@@ -1304,8 +1416,10 @@ function seedProject(projectRoot, name, map) {
   manifest.base_hashes = computeBaseHashes(projectRoot, manifest);
   writeJSON(manifestPath(projectRoot), manifest);
 
-  // Merge any existing rule files into master
-  pushRuleFiles(projectRoot);
+  // Merge any existing rule files into master, then record the rule base
+  pushRuleFiles(projectRoot, manifest);
+  manifest.rule_base = computeRuleBase(projectRoot);
+  writeJSON(manifestPath(projectRoot), manifest);
 
   console.log(`  Imported ${imported} items from ${norm(projectRoot)}`);
   if (name) console.log(`  claude-md -> ${name}.md, settings -> ${name}.json${config.mcp ? `, mcp -> ${name}.json` : ''}`);
@@ -1404,6 +1518,12 @@ function printUsage() {
     --profile <name>    Use a named profile (with --init)
     --from <path>       Copy config from another project (with --init)
     --name <slug>       Slug for claude-md/settings/mcp (with --seed)
+
+  Skill triggers:
+    skill-rules.json is generated from master-skill-rules.json on sync. A push
+    merges a skill's triggers back only when the master's copy has not moved
+    since this project last synced, so a stale copy cannot undo a newer one.
+    --push --category skills --item <skill> --force pushes that skill's anyway.
 
   Ignore patterns:
     Configure in map.json "ignore" key to exclude runtime artifacts from
